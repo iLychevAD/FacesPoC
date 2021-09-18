@@ -3,16 +3,59 @@ Transform: AWS::Serverless-2016-10-31
 Description: |
   Client data upload and gender by foto recognition demo
   
+Parameters:
+  ApiGwToken:
+    Type: String
+    #Default: ''
+    AllowedPattern: "^[a-zA-Z0-9]*$"
+    MinLength: 12
+    Description: a token to protect API GW
+  
 Resources:
   SignedUrlsApiGateway:
     Type: AWS::Serverless::Api
     Properties:
       #Name: !Ref AWS::StackName
       StageName: v1
+      Auth:
+        DefaultAuthorizer: LambdaAuthorizer
+        Authorizers:
+          LambdaAuthorizer:
+            FunctionArn: !GetAtt LambdaAuthorizer.Arn
+            #FunctionInvokeRole: !GetAtt authorizerFunctionRole.Arn
+            FunctionPayloadType: REQUEST
+            Identity:
+              Headers:
+                - token
       MethodSettings:
         - LoggingLevel: INFO
           ResourcePath: '/*' # allows for logging on any resource
           HttpMethod: '*' # allows for logging on any method
+
+  LambdaAuthorizer:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode:
+        !Sub |
+            exports.authorizer = async (event) => {
+                let response = {
+                    "principalId": "user",
+                    "policyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Action": "execute-api:Invoke",
+                            "Effect": "Deny",
+                            "Resource": event.methodArn
+                        }]
+                    }
+                };
+                if (event.headers.token == "${ApiGwToken}") {
+                    response['policyDocument']['Statement'][0]['Effect'] = "Allow";
+                }
+                return response;
+            };
+      Handler: index.authorizer
+      Runtime: nodejs14.x
 
   PhotosBucket:
     Type: AWS::S3::Bucket
@@ -164,5 +207,9 @@ Outputs:
   SignedUrlsApiGateway:
     Description: 'API Gateway endpoint URL for obtaining presigned URL'
     Value: !Sub 'https://${SignedUrlsApiGateway}.execute-api.${AWS::Region}.amazonaws.com/v1/signed-url'
+
+  ApiGwToken:
+    Value: !Ref ApiGwToken
+    Description: API GW secret token to be passed in the "token" header
 
 

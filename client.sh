@@ -28,6 +28,7 @@ done
 echo "Obtain a signed URL"
 SIGNED_URL=$( 
   curl -X GET \
+  -H "token: ${API_GW_TOKEN}" \
   "${GET_SIGNEDURL_ENDPOINT}?${PARAMS}"
 )
 
