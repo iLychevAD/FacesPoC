@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  Client data upload and gender by foto recognition demo
+  
+Resources:
+  SignedUrlsApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      #Name: !Ref AWS::StackName
+      StageName: v1
+      MethodSettings:
+        - LoggingLevel: INFO
+          ResourcePath: '/*' # allows for logging on any resource
+          HttpMethod: '*' # allows for logging on any method
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # https://github.com/aws/serverless-application-model/issues/1109
+      BucketName: !Join [ "-", [ "photos", !Select [2, !Split ["/", !Ref AWS::StackId]] ] ]
+  
+  # Returns S3 signed URL to make a client able to upload a file 
+  SignedUrlsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode:
+        !Sub |
+            import uuid
+            import boto3
+
+            def lambda_handler(event, context):
+                # Get the service client.
+                s3 = boto3.client('s3')
+                # Generate a random S3 key name
+                upload_key = uuid.uuid4().hex
+                # To allow a client to pass "x-amz-meta-*" headers for an S3 object metadata
+                # upon uploading a file, we need to include them into the presigned url 
+                metadata = event["queryStringParameters"]
+                # To ease debug of the PoC version I am just using person's name as S3 filename
+                upload_key = f'{metadata["firstname"]}-{metadata["surname"]}.jpg'
+                # Generate the presigned URL               
+                presigned_url = s3.generate_presigned_url(
+                    ClientMethod='put_object',
+                    ExpiresIn=3600,
+                    Params={
+                        'Bucket': '${PhotosBucket}',
+                        'Key': upload_key,
+                        'Metadata': metadata,
+                        'ContentDisposition': 'inline'
+                    }
+                    #ClientMethod='put_object',
+                    #Bucket="${PhotosBucket}",
+                    #Key=upload_key,
+                    #Fields={"content-type": "image/jpg"},
+                    #Conditions=["starts-with", "$content-type", "image/"],
+                    #ExpiresIn=3600
+                )
+                print(f'metadata: {metadata}, key: {upload_key}, presigned_url: {presigned_url}')
+
+                return {
+                    "statusCode": 200,
+                    "body": presigned_url
+                }
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 60
+      Policies:
+      - Statement:
+        - Sid: AllowGeneratePresignedUrlForPutObject
+          Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource: !Sub 'arn:aws:s3:::${PhotosBucket}/*'
+      Events:
+        PublicApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SignedUrlsApiGateway
+            Path: /signed-url
+            Method: GET
+  
+  # Upon adding a new file to S3 this function uses AWS Rekognition to detect 
+  # the gender and saves it as AWS resource tag on the file
+  DetectGenderAndSetTagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode:
+        !Sub |
+            import boto3
+            s3 = boto3.client('s3')
+            rekognition = boto3.client('rekognition')
+            
+            def lambda_handler(event, context):
+                # Get the object from the event
+                bucket = event['Records'][0]['s3']['bucket']['name']
+                key = event['Records'][0]['s3']['object']['key']
+                print(f'a new file "{key}" in the bucket "{bucket}"')
+                try:
+                    # Call Amazon Rekognition
+                    rekognition_response = rekognition.detect_faces(
+                        Image={
+                            'S3Object': {
+                                'Bucket': bucket,
+                                'Name': key
+                            }
+                        },
+                        Attributes=[
+                            'ALL'
+                        ]
+                    )
+                    
+                    # Save gender to AWS tag
+                    print(f'rekognition: {rekognition_response}')
+                    if rekognition_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                        gender = rekognition_response['FaceDetails'][0]['Gender']['Value']
+
+                        s3.put_object_tagging(
+                            Bucket=bucket,
+                            Key=key,    
+                            Tagging={
+                                'TagSet': [
+                                    {
+                                        'Key': 'Gender',
+                                        'Value': gender
+                                    }
+                                ]
+                            }
+                        )
+                except Exception as e:
+                    print(e)
+                    print(f'Error processing object "{key}" in the bucket "{bucket}"')
+                    raise e
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 60
+      Policies:
+      #- AWSLambdaExecute
+      - RekognitionDetectOnlyPolicy: {}
+      # Cannot use references because of the circular dependency, see
+      # https://github.com/aws/serverless-application-model/issues/1109
+      - S3CrudPolicy:
+          BucketName: !Join [ "-", [ "photos", !Select [2, !Split ["/", !Ref AWS::StackId]] ] ]
+      - Statement:
+        - Sid: AllowTagging
+          Effect: Allow
+          Action:
+          - s3:PutObjectTagging
+          Resource: !Join [ "", [ "arn:aws:s3:::photos-", !Select [2, !Split ["/", !Ref AWS::StackId]], "/*" ] ]
+      #- Statement:
+      #  - Sid: AllowS3ReadWrite
+      #    Effect: Allow
+      #    Action:
+      #    - s3:*
+      #    Resource: !Sub 'arn:aws:s3:::${PhotosBucket}/*'
+      Events:
+        PhotoUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref PhotosBucket
+            Events: s3:ObjectCreated:*
+ 
+Outputs:
+  SignedUrlsApiGateway:
+    Description: 'API Gateway endpoint URL for obtaining presigned URL'
+    Value: !Sub 'https://${SignedUrlsApiGateway}.execute-api.${AWS::Region}.amazonaws.com/v1/signed-url'
+
+
